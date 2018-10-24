@@ -359,8 +359,55 @@ function ApiCache() {
     }
   }
 
+  function getCachedResponse(redis, key, req, res, next, strDuration, middlewareToggle, duration) {
+    redis.hgetall(key, function (err, obj) {
+      if (!err && obj && obj.response) {
+        var elapsed = new Date() - req.apicacheTimer
+        debug('sending cached (redis) version of', key, logDuration(elapsed))
+        return sendCachedResponse(req, res, JSON.parse(obj.response), middlewareToggle)
+      } else {
+        return makeResponseCacheable(req, res, next, key, duration, strDuration, middlewareToggle)
+      }
+    })
+  }
+
+  function maybeGetCachedResponse(opt, redis, key, req, res, next, strDuration, middlewareToggle, duration) {
+    if (!(opt.refreshAtTTL > 0)) {
+      return getCachedResponse(redis, key, req, res, next, strDuration, middlewareToggle, duration)
+    }
+
+    // HACK: this relies on the redis client being bluebird promisified
+    redis.ttlAsync(key).then(function(ttl) {
+      debug('ttl of', [ttl], key)
+      if (ttl > 0 && ttl < opt.refreshAtTTL) {
+        debug('Trying for refresh lock')
+        // Attempt to acquire a refresh lock, if successful use this request as a cache warm for everyone else.
+        redis.setAsync(key + "refresh", 1, 'EX', 30, 'NX').then(function(acquired) {
+          debug('Result from refresh lock', acquired)
+          if (acquired === null) {
+            // Key is already set, use the cache.
+            return getCachedResponse(redis, key, req, res, next, strDuration, middlewareToggle, duration)
+          } else {
+            // Acquired the lock, perform the actual query
+            debug('perform cache warm for', key)
+            return makeResponseCacheable(req, res, next, key, duration, strDuration, middlewareToggle)
+          }
+        })
+      } else {
+        return getCachedResponse(redis, key, req, res, next, strDuration, middlewareToggle, duration)
+      }
+    }).catch(function() {
+      return makeResponseCacheable(req, res, next, key, duration, strDuration, middlewareToggle)
+    })
+  }
+
   this.middleware = function cache(strDuration, middlewareToggle, localOptions) {
     var duration = instance.getDuration(strDuration)
+
+    if (localOptions.refreshAtTTL) {
+      localOptions.refreshAtTTL = instance.getDuration(localOptions.refreshAtTTL) / 1000
+    }
+
     var opt = {}
 
     middlewareOptions.push({
@@ -436,16 +483,7 @@ function ApiCache() {
       // send if cache hit from redis
       if (redis) {
         try {
-          redis.hgetall(key, function (err, obj) {
-            if (!err && obj && obj.response) {
-              var elapsed = new Date() - req.apicacheTimer
-              debug('sending cached (redis) version of', key, logDuration(elapsed))
-
-              return sendCachedResponse(req, res, JSON.parse(obj.response), middlewareToggle)
-            } else {
-              return makeResponseCacheable(req, res, next, key, duration, strDuration, middlewareToggle)
-            }
-          })
+          return maybeGetCachedResponse(opt, redis, key, req, res, next, strDuration, middlewareToggle, duration)
         } catch (err) {
           // bypass redis on error
           return makeResponseCacheable(req, res, next, key, duration, strDuration, middlewareToggle)
